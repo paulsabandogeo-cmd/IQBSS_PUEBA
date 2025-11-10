@@ -1,0 +1,685 @@
+// ================== CONFIGURACIÓN SUPABASE ==================
+// 1) Rellena con tus credenciales
+const SB_URL = 'https://wvguddxoszgpvxgqpapf.supabase.co';
+const SB_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Ind2Z3VkZHhvc3pncHZ4Z3FwYXBmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjI0MzA4NzYsImV4cCI6MjA3ODAwNjg3Nn0.uFBB7JORRMKKC9SlqvJq3dOl3W5PbirSpMtE8s2cz_w';
+
+const sbHeaders = () => ({ 'apikey': SB_KEY, 'Authorization': `Bearer ${SB_KEY}` });
+
+// ================== CAPAS ==================
+const TABLES = [
+  'agua_potable',
+  'alcantarillado',   // hasta 4000
+  'barrios',
+  'bomberos_wgs84',
+  'policia_wgs84',
+  'salud_wgs84',
+  'reportes'          // capa de reportes
+];
+
+const LAYER_LABELS = {
+  agua_potable: 'Agua Potable',
+  alcantarillado: 'Alcantarillado',
+  barrios: 'Barrios',
+  bomberos_wgs84: 'Bomberos',
+  policia_wgs84: 'Policía',
+  salud_wgs84: 'Salud',
+  reportes: 'Reportes'
+};
+
+const LAYER_ICONS = {
+  agua_potable: '💧',
+  alcantarillado: '🛠️',
+  barrios: '🧭',
+  bomberos_wgs84: '🚒',
+  policia_wgs84: '🚓',
+  salud_wgs84: '🚑',
+  reportes: '📝'
+};
+
+const LAYER_CONFIG = {
+  alcantarillado: { lazy: false, pageSize: 1000, maxFeatures: 4000 },
+  reportes:      { lazy: false, pageSize: 1000, maxFeatures: 5000 }
+};
+
+// ================== ESTADO ==================
+let map;
+const LAYER_STORE = new Map(); // name -> { layerGroup, bounds, loaded }
+const LABELS = { barrios: L.layerGroup() };
+const HILITES = { barrio: L.layerGroup(), click: L.layerGroup(), picking: L.layerGroup() };
+let pickMode = false;
+
+const REPORT_FILTERS = { tipo: '__all__', days: 30 };
+
+// ================== UTIL ==================
+function debounce(fn, ms){ let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; }
+const fmtMeters = (m) => (m == null || isNaN(m)) ? '—' : (m < 1000 ? `${Math.round(m)} m` : `${(m/1000).toFixed(2)} km`);
+const fmtFecha = (iso) => { try { return new Date(iso).toLocaleString(); } catch { return iso || '—'; } };
+
+function defaultStyle(geomType) {
+  if (!geomType) return {};
+  if (/Line/i.test(geomType)) return { color:'#2f7be5', weight: 2 };
+  if (/Polygon/i.test(geomType)) return { color:'#2f7be5', weight: 1, fillOpacity: 0.2 };
+  return {};
+}
+
+function onEachFeature(feature, layer) {
+  const props = feature?.properties ?? {};
+  const rows = Object.entries(props)
+    .filter(([k]) => !/^geom|^geometry|^st_/i.test(k))
+    .slice(0, 30)
+    .map(([k,v]) => `<tr><th style="text-align:left; padding-right:6px;">${k}</th><td>${v === null ? '<em>null</em>' : String(v)}</td></tr>`)
+    .join('');
+  layer.bindPopup(`<div style="max-width:320px"><table>${rows || '<tr><td><em>Sin atributos</em></td></tr>'}</table></div>`);
+}
+
+function parseWKT(wkt) {
+  const s = wkt.trim();
+  const type = s.split('(')[0].trim().toUpperCase();
+  const body = s.substring(s.indexOf('('));
+  const coord = (str) => str.trim().split(/\s+/).map(Number);
+  const parseTupleList = (str) => str.split(',').map(t => coord(t));
+  const strip = (str) => str.replace(/^\(/,'').replace(/\)$/,'');
+  const splitLevel = (str) => { const out=[]; let lvl=0, st=0;
+    for(let i=0;i<str.length;i++){ const c=str[i];
+      if(c==='(')lvl++; else if(c===')')lvl--;
+      else if(c===',' && lvl===0){ out.push(str.slice(st,i)); st=i+1; } }
+    out.push(str.slice(st)); return out.map(x=>x.trim());
+  };
+  if (type.startsWith('POINT')) return { type:'Point', coordinates: coord(strip(body)) };
+  if (type.startsWith('MULTIPOINT')) {
+    const inner = strip(body);
+    const parts = inner.includes('(') ? splitLevel(inner).map(x=>coord(strip(x))) : parseTupleList(inner);
+    return { type:'MultiPoint', coordinates: parts };
+  }
+  if (type.startsWith('LINESTRING')) return { type:'LineString', coordinates: parseTupleList(strip(body)) };
+  if (type.startsWith('MULTILINESTRING')) {
+    const parts = splitLevel(strip(body)).map(seg => parseTupleList(strip(seg)));
+    return { type:'MultiLineString', coordinates: parts };
+  }
+  if (type.startsWith('POLYGON')) {
+    const rings = splitLevel(strip(body)).map(r => parseTupleList(strip(r)));
+    return { type:'Polygon', coordinates: rings };
+  }
+  if (type.startsWith('MULTIPOLYGON')) {
+    const polys = splitLevel(strip(body)).map(poly => splitLevel(strip(poly)).map(r => parseTupleList(strip(r))));
+    return { type:'MultiPolygon', coordinates: polys };
+  }
+  throw new Error('Tipo WKT no soportado: ' + type);
+}
+
+// ================== FETCH GEOJSON ==================
+async function fetchAsGeoJSON(tableName, limit=10000, offset=0) {
+  try {
+    const url1 = new URL(`${SB_URL}/rest/v1/${tableName}`);
+    url1.searchParams.set('select', '*,geom_geojson=st_asgeojson(geom)');
+    url1.searchParams.set('limit', String(limit));
+    url1.searchParams.set('offset', String(offset));
+    const r1 = await fetch(url1, { headers: { ...sbHeaders(), 'Prefer': 'count=exact' } });
+    if (r1.ok) {
+      const rows = await r1.json();
+      const feats = [];
+      for (const row of rows) {
+        let geom = null;
+        try { geom = row.geom_geojson ? JSON.parse(row.geom_geojson) : null; } catch {}
+        const props = { ...row }; delete props.geom; delete props.geometry; delete props.geom_geojson;
+        if (geom) feats.push({ type:'Feature', geometry: geom, properties: props });
+      }
+      if (feats.length) return { type:'FeatureCollection', features: feats };
+    }
+  } catch(e){}
+
+  try {
+    const url2 = new URL(`${SB_URL}/rest/v1/${tableName}`);
+    url2.searchParams.set('select', '*');
+    url2.searchParams.set('limit', String(limit));
+    url2.searchParams.set('offset', String(offset));
+    const r2 = await fetch(url2, { headers: sbHeaders() });
+    if (r2.ok) {
+      const rows = await r2.json();
+      const feats = [];
+      for (const row of rows) {
+        let geom = null;
+        try {
+          if (row.geom && typeof row.geom === 'string') { const parsed = JSON.parse(row.geom); if (parsed?.type) geom = parsed; }
+          else if (row.geom && typeof row.geom === 'object' && row.geom.type) geom = row.geom;
+          else if (row.geometry && typeof row.geometry === 'object' && row.geometry.type) geom = row.geometry;
+        } catch {}
+        const props = { ...row }; delete props.geom; delete props.geometry;
+        if (geom) feats.push({ type:'Feature', geometry: geom, properties: props });
+      }
+      if (feats.length) return { type:'FeatureCollection', features: feats };
+    }
+  } catch(e){}
+
+  const url3 = new URL(`${SB_URL}/rest/v1/${tableName}`);
+  url3.searchParams.set('select', '*,geom_wkt=geom::text');
+  url3.searchParams.set('limit', String(limit));
+  url3.searchParams.set('offset', String(offset));
+  const r3 = await fetch(url3, { headers: sbHeaders() });
+  if (!r3.ok) throw new Error(`Error ${r3.status} al leer ${tableName}`);
+  const rows3 = await r3.json();
+  const feats3 = [];
+  for (const row of rows3) {
+    let geom = null;
+    if (row.geom_wkt && typeof row.geom_wkt === 'string') { try { geom = parseWKT(row.geom_wkt); } catch {} }
+    const props = { ...row }; delete props.geom; delete props.geometry; delete props.geom_wkt;
+    if (geom) feats3.push({ type:'Feature', geometry: geom, properties: props });
+  }
+  return { type:'FeatureCollection', features: feats3 };
+}
+
+// ================== CAPAS BASE ==================
+function addLayerToMap(tableName, geojson) {
+  if (!geojson?.features?.length) return null;
+  const firstGeom = geojson.features.find(f => f.geometry)?.geometry?.type || '';
+  const iconEmoji = LAYER_ICONS[tableName] || '📍';
+  const pointToLayer = (feature, latlng) => {
+    const div = L.divIcon({
+      className: 'emoji-marker',
+      html: `<span style="font-size:16px; line-height:16px;">${iconEmoji}</span>`,
+      iconSize: [16,16], iconAnchor:[8,8]
+    });
+    return L.marker(latlng, { icon: div });
+  };
+  const layer = L.geoJSON(geojson, { style: () => defaultStyle(firstGeom), pointToLayer, onEachFeature });
+  const group = L.layerGroup([layer]).addTo(map);
+  const b = layer.getBounds();
+  return { layerGroup: group, bounds: b, loaded: true };
+}
+
+async function loadLayerFully(tableName, pageSize=10000, maxFeatures=Infinity) {
+  let offset = 0; const all = [];
+  while (true) {
+    const fc = await fetchAsGeoJSON(tableName, pageSize, offset);
+    const n = fc.features.length;
+    if (!n) break;
+    all.push(...fc.features);
+    offset += n;
+    if (all.length >= maxFeatures) break;
+    if (n < pageSize) break;
+  }
+  if (!all.length) return null;
+  const sliced = maxFeatures === Infinity ? all : all.slice(0, maxFeatures);
+  return addLayerToMap(tableName, { type:'FeatureCollection', features: sliced });
+}
+
+async function loadAllLayers(names) {
+  LAYER_STORE.clear();
+  for (const name of names) {
+    const cfg = LAYER_CONFIG[name] || {};
+    const page = cfg.pageSize || 10000;
+    const maxF = cfg.maxFeatures || Infinity;
+    try {
+      const state = await loadLayerFully(name, page, maxF);
+      if (state) LAYER_STORE.set(name, state);
+    } catch (e) { console.warn('No se pudo cargar', name, e); }
+  }
+  renderLayerList(Array.from(LAYER_STORE.keys()));
+
+  // Fit a todo
+  fitAllLayers();
+}
+
+function fitAllLayers(){
+  let union = null;
+  for (const [, st] of LAYER_STORE.entries()) {
+    if (st?.bounds?.isValid()) {
+      union = union ? union.extend(st.bounds) : L.latLngBounds(st.bounds.getSouthWest(), st.bounds.getNorthEast());
+    }
+  }
+  if (union && union.isValid()) map.fitBounds(union, { padding:[12,12] });
+}
+
+function renderLayerList(names) {
+  const c = document.getElementById('layers'); c.innerHTML = '';
+  document.getElementById('capasCount').textContent = String(names.length);
+  names.forEach(name => {
+    const wrap = document.createElement('div'); wrap.className = 'layer-item';
+    const chk = document.createElement('input'); chk.type = 'checkbox'; chk.checked = true;
+    const label = document.createElement('label');
+    const pretty = LAYER_LABELS[name] || name;
+    const icon = LAYER_ICONS[name] || '📍';
+    label.textContent = `${icon} ${pretty}`;
+    label.style.cursor = 'pointer';
+
+    chk.onchange = () => {
+      const st = LAYER_STORE.get(name);
+      if (!st) return;
+      if (chk.checked) { st.layerGroup.addTo(map); } else { map.removeLayer(st.layerGroup); }
+    };
+    label.onclick = () => {
+      const st = LAYER_STORE.get(name);
+      if (st?.bounds?.isValid()) map.fitBounds(st.bounds, { padding:[8,8] });
+    };
+
+    wrap.appendChild(chk);
+    wrap.appendChild(label);
+    c.appendChild(wrap);
+  });
+}
+
+// ================== RPC: BARRIOS ==================
+async function rpcBarriosSearch(term) {
+  if (!term || term.trim().length < 2) return [];
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/fn_barrios_search`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Prefer': 'params=single-object', ...sbHeaders() },
+    body: JSON.stringify({ term })
+  });
+  if (!r.ok) return [];
+  const data = await r.json();
+  return Array.isArray(data) ? data : [data];
+}
+
+async function rpcBarrioResumen(barrio) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/fn_barrios_resumen`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Prefer': 'params=single-object', ...sbHeaders() },
+    body: JSON.stringify({ p_barrio: barrio })
+  });
+  if (!r.ok) {
+    const txt = await r.text().catch(()=>'');
+    throw new Error(`rpc resumen ${r.status}: ${txt}`);
+  }
+  const data = await r.json();
+  const row = Array.isArray(data) ? data[0] : data;
+  return row || { barrio, alcantarillado_m:0, has_bomberos:false, has_policia:false, has_salud:false };
+}
+
+// ================== ETIQUETAS: BARRIOS ==================
+async function loadBarrioLabels() {
+  try {
+    const url = new URL(`${SB_URL}/rest/v1/barrios`);
+    url.searchParams.set('select', 'BARRIO,label_geom=st_asgeojson(st_pointonsurface(geom))');
+    url.searchParams.set('limit', '20000');
+    const r = await fetch(url, { headers: sbHeaders() });
+    if (!r.ok) return;
+    const rows = await r.json();
+    rows.forEach(row => {
+      if (!row.label_geom) return;
+      const gj = JSON.parse(row.label_geom);
+      if (!gj || gj.type !== 'Point') return;
+      const [lon, lat] = gj.coordinates;
+      const div = L.divIcon({
+        className: 'label-barrio',
+        html: `<span style="background:rgba(10,20,40,.65); padding:2px 6px; border:1px solid #173055; border-radius:6px; color:#d6e6ff;">${row.BARRIO}</span>`,
+        iconSize: [0,0]
+      });
+      LABELS.barrios.addLayer(L.marker([lat, lon], { icon: div, interactive:false }));
+    });
+    LABELS.barrios.addTo(map);
+  } catch(e) { console.warn('labels barrios error', e); }
+}
+
+// ================== HIGHLIGHT + PANEL ==================
+async function highlightBarrio(barrio) {
+  try {
+    HILITES.barrio.clearLayers();
+    const url = new URL(`${SB_URL}/rest/v1/barrios`);
+    url.searchParams.set('select','*,geom_geojson=st_asgeojson(geom)');
+    url.searchParams.set('BARRIO','eq.' + encodeURIComponent(barrio));
+    url.searchParams.set('limit','1');
+    const r = await fetch(url, { headers: sbHeaders() });
+    const rows = r.ok ? await r.json() : [];
+    if (rows.length && rows[0].geom_geojson) {
+      const gj = JSON.parse(rows[0].geom_geojson);
+      const layer = L.geoJSON(gj, { style:{ color:'#51a2ff', weight:2, fillOpacity:0.05 }});
+      HILITES.barrio.addLayer(layer);
+      const b = layer.getBounds(); if (b?.isValid()) map.fitBounds(b, { padding:[12,12] });
+    }
+  } catch(e) { console.warn('highlight error', e); }
+}
+
+function updateInfoPanel(contentHtml) {
+  const panel = document.getElementById('infoPanel');
+  panel.classList.remove('muted');
+  panel.innerHTML = contentHtml;
+}
+
+function barrioSummaryHTML(res) {
+  return `
+    <table>
+      <tr><th style="width:40%;">Barrio</th><td>${res.barrio}</td></tr>
+      <tr><th>Long. alcantarillado</th><td>${fmtMeters(res.alcantarillado_m)}</td></tr>
+      <tr><th>Bomberos</th><td>${res.has_bomberos ? 'Sí' : 'No'}</td></tr>
+      <tr><th>Policía</th><td>${res.has_policia ? 'Sí' : 'No'}</td></tr>
+      <tr><th>Salud</th><td>${res.has_salud ? 'Sí' : 'No'}</td></tr>
+    </table>`;
+}
+
+// ================== DISTANCIAS DESDE CLICK ==================
+async function nearestDistanceMeters(table, lat, lon) {
+  const url = new URL(`${SB_URL}/rest/v1/${table}`);
+  const expr = `st_distance(geom::geography,st_setsrid(st_point(${lon},${lat}),4326)::geography)`;
+  url.searchParams.set('select', `dist=${expr}`);
+  url.searchParams.set('order', 'dist.asc');
+  url.searchParams.set('limit', '1');
+  const r = await fetch(url, { headers: sbHeaders() });
+  if (!r.ok) return null;
+  const rows = await r.json();
+  if (!rows.length) return null;
+  const d = rows[0]?.dist;
+  return (typeof d === 'number') ? d : Number(d);
+}
+
+async function handleMapClick(e) {
+  const { lat, lng } = e.latlng;
+
+  if (pickMode) {
+    HILITES.picking.clearLayers();
+    HILITES.picking.addLayer(L.marker([lat,lng]));
+    document.getElementById('f_lat').value = lat.toFixed(6);
+    document.getElementById('f_lon').value = lng.toFixed(6);
+    document.getElementById('formMsg').textContent = 'Coordenadas seleccionadas desde el mapa.';
+    return;
+  }
+
+  try {
+    HILITES.click.clearLayers();
+    HILITES.click.addLayer(L.circleMarker([lat,lng], { radius:6, color:'#51a2ff', weight:2 }));
+
+    const [dBom, dPol, dSal] = await Promise.all([
+      nearestDistanceMeters('bomberos_wgs84', lat, lng),
+      nearestDistanceMeters('policia_wgs84', lat, lng),
+      nearestDistanceMeters('salud_wgs84', lat, lng)
+    ]);
+
+    const html = `
+      <div class="small" style="margin-bottom:6px;"><strong>Punto clicado</strong>: ${lat.toFixed(6)}, ${lng.toFixed(6)}</div>
+      <table>
+        <tr><th style="width:50%;">Distancia a Bomberos</th><td>${fmtMeters(dBom)}</td></tr>
+        <tr><th>Distancia a Policía</th><td>${fmtMeters(dPol)}</td></tr>
+        <tr><th>Distancia a Salud</th><td>${fmtMeters(dSal)}</td></tr>
+      </table>`;
+    updateInfoPanel(html);
+  } catch {
+    updateInfoPanel(`<div class="small">No se pudieron calcular las distancias.</div>`);
+  }
+}
+
+// ================== RPC: REPORTES ==================
+async function rpcReportesListar(limit=1000, tipo='__all__', days=0) {
+  const url = new URL(`${SB_URL}/rest/v1/reportes_geojson`);
+  url.searchParams.set('select', 'id,created_at,updated_at,nombre,tipo,comentarios,geom_geojson');
+  url.searchParams.set('order', 'created_at.desc');
+  url.searchParams.set('limit', String(limit));
+  if (tipo && tipo !== '__all__') url.searchParams.set('tipo', `eq.${encodeURIComponent(tipo)}`);
+  if (days && Number(days) > 0) {
+    const d = new Date(); d.setDate(d.getDate() - Number(days));
+    const iso = d.toISOString();
+    url.searchParams.set('created_at', `gte.${iso}`);
+  }
+  const r = await fetch(url, { headers: sbHeaders() });
+  if (!r.ok) return [];
+  return await r.json();
+}
+
+async function rpcReporteCrear(payload) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/fn_reporte_crear`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'Prefer': 'params=single-object', ...sbHeaders() },
+    body: JSON.stringify(payload)
+  });
+  if (!r.ok) {
+    const t = await r.text().catch(()=> '');
+    throw new Error(`Error al crear reporte (${r.status}): ${t}`);
+  }
+  const data = await r.json();
+  return Array.isArray(data) ? data[0] : data;
+}
+
+// ================== CAPA REPORTES ==================
+function buildReportesLayer(features) {
+  const iconEmoji = LAYER_ICONS['reportes'] || '📝';
+  const pointToLayer = (feature, latlng) => {
+    const div = L.divIcon({
+      className: 'emoji-marker',
+      html: `<span style="font-size:16px; line-height:16px;">${iconEmoji}</span>`,
+      iconSize: [16,16], iconAnchor:[8,8]
+    });
+    return L.marker(latlng, { icon: div });
+  };
+  const layer = L.geoJSON({ type:'FeatureCollection', features }, {
+    pointToLayer,
+    onEachFeature: (feature, lyr) => {
+      onEachFeature(feature, lyr);
+      lyr.on('click', () => {
+        const p = feature.properties || {};
+        const html = `
+          <div class="small" style="margin-bottom:6px;"><strong>Reporte #${p.id || ''}</strong></div>
+          <table>
+            <tr><th>Fecha</th><td>${fmtFecha(p.fecha || p.created_at)}</td></tr>
+            <tr><th>Nombre</th><td>${p.nombre || '—'}</td></tr>
+            <tr><th>Tipo</th><td>${p.tipo || '—'}</td></tr>
+            <tr><th>Comentarios</th><td>${p.comentarios || '—'}</td></tr>
+          </table>`;
+        updateInfoPanel(html);
+      });
+    }
+  });
+  const group = L.layerGroup([layer]).addTo(map);
+  const b = layer.getBounds();
+  return { layerGroup: group, bounds: b, loaded: true };
+}
+
+async function refreshReportesLayer(flyToLatLng=null) {
+  const existing = LAYER_STORE.get('reportes');
+  if (existing) try { map.removeLayer(existing.layerGroup); } catch {}
+
+  const { tipo, days } = REPORT_FILTERS;
+
+  const rows = await rpcReportesListar(1000, tipo, days);
+  const feats = rows.filter(r => r.geom_geojson).map(r => ({
+    type:'Feature',
+    geometry: JSON.parse(r.geom_geojson),
+    properties: {
+      id: r.id, fecha: r.created_at, nombre: r.nombre, tipo: r.tipo, comentarios: r.comentarios
+    }
+  }));
+
+  const state = buildReportesLayer(feats);
+  LAYER_STORE.set('reportes', state);
+  renderLayerList(Array.from(LAYER_STORE.keys()));
+
+  if (flyToLatLng) map.flyTo(flyToLatLng, Math.max(map.getZoom(), 16));
+
+  if (feats.length) {
+    const p = feats[0].properties;
+    const html = `
+      <div class="small" style="margin-bottom:6px;"><strong>Último reporte</strong></div>
+      <table>
+        <tr><th>Fecha</th><td>${fmtFecha(p.fecha)}</td></tr>
+        <tr><th>Nombre</th><td>${p.nombre || '—'}</td></tr>
+        <tr><th>Tipo</th><td>${p.tipo || '—'}</td></tr>
+        <tr><th>Comentarios</th><td>${p.comentarios || '—'}</td></tr>
+      </table>`;
+    updateInfoPanel(html);
+  }
+}
+
+// ================== UI ==================
+function setupBarrioSearchUI() {
+  const q = document.getElementById('qBarrio');
+  const rdiv = document.getElementById('rBarrio');
+
+  const renderResults = (items) => {
+    rdiv.innerHTML = '';
+    if (!items.length) { rdiv.textContent = 'Sin resultados'; rdiv.classList.add('muted'); return; }
+    rdiv.classList.remove('muted');
+    const ul = document.createElement('ul'); ul.style.listStyle='none'; ul.style.padding='0'; ul.style.margin='4px 0';
+    items.forEach(it => {
+      const li = document.createElement('li');
+      li.style.cursor='pointer'; li.style.padding='4px 0';
+      li.innerHTML = `<span>${(LAYER_ICONS['barrios'] || '🧭')} ${it.barrio}</span>`;
+      li.onclick = async () => {
+        await highlightBarrio(it.barrio);
+        try {
+          const res = await rpcBarrioResumen(it.barrio);
+          updateInfoPanel(barrioSummaryHTML(res));
+        } catch (e) {
+          updateInfoPanel(`<div class="small">No se pudo obtener el resumen. ${e.message||''}</div>`);
+        }
+      };
+      ul.appendChild(li);
+    });
+    rdiv.appendChild(ul);
+  };
+
+  q.addEventListener('input', debounce(async () => {
+    const items = await rpcBarriosSearch(q.value.trim());
+    renderResults(items);
+  }, 250));
+}
+
+function setupFormUI() {
+  const elMsg = document.getElementById('formMsg');
+  const elNombre = document.getElementById('f_nombre');
+  const elTipo = document.getElementById('f_tipo');
+  const elComent = document.getElementById('f_coment');
+  const elLat = document.getElementById('f_lat');
+  const elLon = document.getElementById('f_lon');
+  const btnLocate = document.getElementById('btnLocate');
+  const btnPick = document.getElementById('btnPick');
+  const btnEnviar = document.getElementById('btnEnviar');
+  const btnLimpiar = document.getElementById('btnLimpiar');
+
+  btnLocate.onclick = () => {
+    if (!navigator.geolocation) { elMsg.textContent = 'Geolocalización no soportada'; return; }
+    elMsg.textContent = 'Obteniendo ubicación…';
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        const { latitude, longitude } = pos.coords;
+        elLat.value = latitude.toFixed(6);
+        elLon.value = longitude.toFixed(6);
+        map.flyTo([latitude, longitude], 17);
+        HILITES.picking.clearLayers();
+        HILITES.picking.addLayer(L.marker([latitude, longitude]));
+        elMsg.textContent = 'Ubicación establecida.';
+      },
+      () => { elMsg.textContent = 'No se pudo obtener la ubicación.'; }
+    );
+  };
+
+  btnPick.onclick = () => {
+    pickMode = !pickMode;
+    if (pickMode) {
+      elMsg.textContent = 'Haz clic en el mapa para elegir las coordenadas.';
+      btnPick.innerHTML = '<i class="ph ph-check"></i> Elegir en mapa (activo)';
+    } else {
+      elMsg.textContent = 'Selección en mapa desactivada.';
+      btnPick.innerHTML = '<i class="ph ph-hand-pointing"></i> Elegir en mapa';
+    }
+  };
+
+  btnLimpiar.onclick = () => {
+    elNombre.value = ''; elComent.value = ''; elLat.value = ''; elLon.value = '';
+    elTipo.value = 'Agua Potable';
+    elMsg.textContent = '';
+    HILITES.picking.clearLayers();
+  };
+
+  btnEnviar.onclick = async () => {
+    const nombre = elNombre.value.trim();
+    const tipo = elTipo.value;
+    const comentarios = elComent.value.trim();
+    const lat = parseFloat(elLat.value);
+    const lon = parseFloat(elLon.value);
+    if (!nombre) { elMsg.textContent = 'Ingresa tu nombre.'; return; }
+    if (Number.isNaN(lat) || Number.isNaN(lon)) { elMsg.textContent = 'Ingresa latitud y longitud válidas.'; return; }
+    elMsg.textContent = 'Enviando…';
+    try {
+      const row = await rpcReporteCrear({
+        p_nombre: nombre,
+        p_tipo: tipo,
+        p_comentarios: comentarios || null,
+        p_lat: lat,
+        p_lon: lon
+      });
+
+      elMsg.textContent = 'Reporte enviado correctamente.';
+      const latlng = L.latLng(lat, lon);
+      await refreshReportesLayer(latlng);
+
+    } catch (e) {
+      elMsg.textContent = 'Error al enviar el reporte.';
+      console.error(e);
+    }
+  };
+}
+
+function setupReportFiltersUI() {
+  const selTipo = document.getElementById('flt_tipo');
+  const inpDays = document.getElementById('flt_days');
+  const btnApply = document.getElementById('btnAplicarFiltros');
+  const btnClear = document.getElementById('btnQuitarFiltros');
+
+  btnApply.onclick = async () => {
+    REPORT_FILTERS.tipo = selTipo.value || '__all__';
+    REPORT_FILTERS.days = Math.max(0, Number(inpDays.value || 0));
+    await refreshReportesLayer(null);
+  };
+
+  btnClear.onclick = async () => {
+    selTipo.value = '__all__';
+    inpDays.value = 30;
+    REPORT_FILTERS.tipo = '__all__';
+    REPORT_FILTERS.days = 30;
+    await refreshReportesLayer(null);
+  };
+}
+
+// ================== INICIO ==================
+async function init() {
+  // mapa
+  map = L.map('map');
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 19,
+    attribution: '&copy; OpenStreetMap'
+  }).addTo(map);
+  map.setView([-1.8, -78.5], 6);
+  setTimeout(() => map.invalidateSize(), 250);
+
+  // grupos
+  HILITES.barrio.addTo(map);
+  HILITES.click.addTo(map);
+  HILITES.picking.addTo(map);
+  LABELS.barrios.addTo(map);
+
+  // estado
+  document.getElementById('status').textContent = 'Cargando capas…';
+
+  // datos base
+  await loadAllLayers(TABLES);
+  await loadBarrioLabels();
+
+  // capa reportes (inicial con filtros por defecto)
+  await refreshReportesLayer();
+
+  document.getElementById('status').textContent = 'Listo.';
+
+  // UI
+  setupBarrioSearchUI();
+  setupFormUI();
+  setupReportFiltersUI();
+  map.on('click', handleMapClick);
+
+  // toolbar
+  document.getElementById('btnFitAll').onclick = fitAllLayers;
+  document.getElementById('chkLabels').onchange = (e) => {
+    if (e.target.checked) LABELS.barrios.addTo(map);
+    else map.removeLayer(LABELS.barrios);
+  };
+  document.getElementById('btnCloseInfo').onclick = () => {
+    document.getElementById('infobox').style.display = 'none';
+  };
+  document.getElementById('chkMini').onchange = (e) => {
+    document.getElementById('infobox').style.display = e.target.checked ? 'block' : 'none';
+  };
+
+  // sidebar collapse
+  const btnCollapse = document.getElementById('btnCollapse');
+  const sidebar = document.getElementById('sidebar');
+  btnCollapse.onclick = () => sidebar.classList.toggle('collapsed');
+}
+
+document.addEventListener('DOMContentLoaded', init);

@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Geoportal SIT — Neo</title>
+
+  <!-- Leaflet -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <!-- Icons -->
+  <link rel="stylesheet" href="https://unpkg.com/@phosphor-icons/web@2.1.1/src/regular/style.css">
+
+  <!-- App styles -->
+  <link rel="stylesheet" href="./styles.css" />
+
+  <!-- Supabase -->
+  <script src="https://unpkg.com/@supabase/supabase-js@2"></script>
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar" id="sidebar">
+      <div class="brand">
+        <div class="logo">SIT</div>
+        <div class="brand-text">
+          <h1>Geoportal</h1>
+          <p>Conectado a Supabase</p>
+        </div>
+        <button id="btnCollapse" class="ghost" title="Colapsar">
+          <i class="ph ph-caret-left"></i>
+        </button>
+      </div>
+
+      <section class="card">
+        <header><i class="ph ph-magnifying-glass"></i> Buscar barrio</header>
+        <div class="field">
+          <input id="qBarrio" type="search" placeholder="Escribe el nombre del barrio…" />
+        </div>
+        <div id="rBarrio" class="results small muted">Sin resultados</div>
+      </section>
+
+      <section class="card">
+        <header><i class="ph ph-note-pencil"></i> Nuevo reporte</header>
+        <div id="formMsg" class="small muted"></div>
+        <div class="grid2">
+          <div class="field">
+            <label>Nombre</label>
+            <input id="f_nombre" type="text" placeholder="Tu nombre" />
+          </div>
+          <div class="field">
+            <label>Tipo</label>
+            <select id="f_tipo">
+              <option>Agua Potable</option>
+              <option>Alcantarillado</option>
+              <option>Bomberos</option>
+              <option>Policía</option>
+              <option>Salud</option>
+              <option>Otro</option>
+            </select>
+          </div>
+        </div>
+        <div class="field">
+          <label>Comentarios</label>
+          <textarea id="f_coment" placeholder="Describe el problema o solicitud"></textarea>
+        </div>
+        <div class="grid2">
+          <div class="field">
+            <label>Latitud</label>
+            <input id="f_lat" type="text" placeholder="-1.2345" />
+          </div>
+          <div class="field">
+            <label>Longitud</label>
+            <input id="f_lon" type="text" placeholder="-78.5432" />
+          </div>
+        </div>
+        <div class="row gap">
+          <button id="btnLocate" class="secondary"><i class="ph ph-target"></i> Usar mi ubicación</button>
+          <button id="btnPick" class="secondary"><i class="ph ph-hand-pointing"></i> Elegir en mapa</button>
+        </div>
+        <div class="row gap">
+          <button id="btnEnviar" class="primary"><i class="ph ph-paper-plane-right"></i> Enviar</button>
+          <button id="btnLimpiar"><i class="ph ph-broom"></i> Limpiar</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><i class="ph ph-funnel"></i> Filtros de reportes</header>
+        <div class="grid2">
+          <div class="field">
+            <label>Tipo</label>
+            <select id="flt_tipo">
+              <option value="__all__">Todos</option>
+              <option>Agua Potable</option>
+              <option>Alcantarillado</option>
+              <option>Bomberos</option>
+              <option>Policía</option>
+              <option>Salud</option>
+              <option>Otro</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>Últimos días</label>
+            <input id="flt_days" type="number" min="0" step="1" value="30" />
+          </div>
+        </div>
+        <div class="row gap">
+          <button id="btnAplicarFiltros" class="secondary"><i class="ph ph-check"></i> Aplicar</button>
+          <button id="btnQuitarFiltros"><i class="ph ph-x"></i> Quitar</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <header><i class="ph ph-layers"></i> Capas <span id="capasCount" class="badge">0</span></header>
+        <div id="layers" class="layers"></div>
+        <p class="small muted">Tip: clic en el nombre de una capa para hacer <em>zoom</em> a su extensión.<br/>“Alcantarillado” carga hasta 4000 elementos.</p>
+      </section>
+
+      <footer class="footer">
+        <div class="status">
+          <i class="ph ph-plug-charging"></i>
+          <span id="status">Inicializando…</span>
+        </div>
+        <div class="credits small muted">SIT · vNeo</div>
+      </footer>
+    </aside>
+
+    <main class="main">
+      <div id="toolbar" class="toolbar glass">
+        <div class="row gap">
+          <button id="btnFitAll" class="secondary"><i class="ph ph-arrows-in-cardinal"></i> Extensión</button>
+          <label class="toggle">
+            <input id="chkLabels" type="checkbox" checked />
+            <span>Etiquetas de barrios</span>
+          </label>
+          <label class="toggle">
+            <input id="chkMini" type="checkbox" checked />
+            <span>Mini panel</span>
+          </label>
+        </div>
+      </div>
+
+      <div id="map"></div>
+
+      <div id="infobox" class="infobox glass">
+        <div class="infobox-header">
+          <h2>Resumen</h2>
+          <button id="btnCloseInfo" class="ghost"><i class="ph ph-x"></i></button>
+        </div>
+        <div id="infoPanel" class="small muted">
+          Haz clic en un barrio, en el mapa o en un reporte para ver el detalle aquí.
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="./app.js"></script>
+</body>
+</html>
